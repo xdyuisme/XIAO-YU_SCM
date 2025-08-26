@@ -1,0 +1,306 @@
+import React, { useState, useEffect } from 'react';
+import { createPortal } from 'react-dom';
+
+// 使用 React 函數型元件
+const App = () => {
+  // 狀態管理
+  const [command, setCommand] = useState('');
+  const [agentStatus, setAgentStatus] = useState('閒置');
+  const [taskLog, setTaskLog] = useState([]);
+  const [sensorData, setSensorData] = useState({});
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [modalContent, setModalContent] = useState({ title: '', message: '' });
+
+  // 模擬即時多模態資料串流
+  useEffect(() => {
+    const sensorInterval = setInterval(() => {
+      setSensorData({
+        temperature: (Math.random() * 5 + 25).toFixed(2),
+        pressure: (Math.random() * 0.5 + 10).toFixed(2),
+        vibration: (Math.random() * 0.05 + 0.1).toFixed(2),
+        defectCount: Math.floor(Math.random() * 5),
+      });
+    }, 1500);
+
+    return () => clearInterval(sensorInterval);
+  }, []);
+
+  // 顯示自定義模態框 (非 alert())
+  const showModal = (title, message) => {
+    setModalContent({ title, message });
+    setIsModalOpen(true);
+  };
+
+  // 處理指令提交
+  const handleCommandSubmit = async (e) => {
+    e.preventDefault();
+    if (!command.trim()) {
+      showModal('錯誤', '請輸入有效的指令。');
+      return;
+    }
+
+    setAgentStatus('思考中');
+    setTaskLog([{ type: 'user', message: `使用者輸入：${command}` }]);
+
+    try {
+      // 步驟 1: 讓 AI Agent 核心規劃並回傳高階計畫與詳細步驟 (JSON 格式)
+      const agentResponse = await getAgentPlan(command);
+      setAgentStatus('規劃完成');
+      setTaskLog(prev => [...prev, { type: 'agent-plan', message: `代理人高階計畫：${agentResponse.plan}` }]);
+
+      // 步驟 2: 傳入詳細步驟並執行任務
+      await executeTask(agentResponse.steps);
+
+    } catch (error) {
+      console.error('代理人操作失敗:', error);
+      setAgentStatus('執行失敗');
+      setTaskLog(prev => [...prev, { type: 'error', message: `執行失敗：${error.message}` }]);
+      showModal('錯誤', '代理人執行任務時發生錯誤。');
+    }
+  };
+
+  // AI Agent 核心的規劃邏輯 (使用 Gemini API)
+  const getAgentPlan = async (userCommand) => {
+    // 新增：請模型生成一個包含「plan」（高階計畫）和「steps」（詳細步驟）的 JSON 物件。
+    const prompt = `您是一個專門用於智慧製造的AI代理人。您的任務是根據使用者指令和即時資料來優化生產流程。
+請根據以下指令，生成一個 JSON 物件，其中包含一個名為 'plan' 的高階行動計畫描述，以及一個名為 'steps' 的陣列，內含各個詳細執行步驟的字串。
+指令：${userCommand}
+即時資料：溫度=${sensorData.temperature}℃, 壓力=${sensorData.pressure}bar, 震動=${sensorData.vibration}g，影像顯示產品品質有輕微波動。`;
+
+    let chatHistory = [];
+    chatHistory.push({ role: "user", parts: [{ text: prompt }] });
+
+    // 設定 generationConfig 來強制要求回傳 JSON 格式
+    const payload = {
+      contents: chatHistory,
+      generationConfig: {
+          responseMimeType: "application/json",
+          responseSchema: {
+              type: "OBJECT",
+              properties: {
+                  "plan": { "type": "STRING" },
+                  "steps": {
+                      "type": "ARRAY",
+                      "items": { "type": "STRING" }
+                  }
+              },
+              "propertyOrdering": ["plan", "steps"]
+          }
+      }
+    };
+
+    const apiKey = "";
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+
+    let response;
+    try {
+      // 實作指數退避策略處理 API 請求
+      const maxRetries = 5;
+      let retryCount = 0;
+      let delay = 1000;
+      while (retryCount < maxRetries) {
+        try {
+          response = await fetch(apiUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+
+          if (response.status === 429) { // 處理頻率限制
+            console.warn(`API 請求被頻率限制，正在進行第 ${retryCount + 1} 次重試...`);
+            await new Promise(res => setTimeout(res, delay));
+            delay *= 2; // 指數退避
+            retryCount++;
+            continue;
+          }
+
+          if (!response.ok) {
+            throw new Error(`HTTP 錯誤! 狀態碼: ${response.status}`);
+          }
+          break; // 成功則跳出迴圈
+        } catch (err) {
+          console.error(`API 請求失敗: ${err.message}`);
+          if (retryCount >= maxRetries - 1) {
+            throw err; // 最後一次重試失敗，拋出錯誤
+          }
+          await new Promise(res => setTimeout(res, delay));
+          delay *= 2;
+          retryCount++;
+        }
+      }
+      if (!response) {
+         throw new Error('API 請求在重試後仍失敗');
+      }
+
+      const result = await response.json();
+      const jsonText = result?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+      if (!jsonText) {
+        throw new Error("API 回應格式錯誤或內容為空");
+      }
+      
+      // 解析 JSON 字串為 JavaScript 物件
+      const parsedJson = JSON.parse(jsonText);
+      
+      // 檢查解析後的物件是否符合預期格式
+      if (!parsedJson.plan || !Array.isArray(parsedJson.steps)) {
+        throw new Error("API 回應的 JSON 格式不正確");
+      }
+
+      return parsedJson;
+    } catch (error) {
+      console.error("生成內容時發生錯誤:", error);
+      // 回傳一個預設的錯誤物件，確保流程不中斷
+      return {
+        plan: "無法生成行動計畫。",
+        steps: ["請檢查網路連線或稍後再試。"]
+      };
+    }
+  };
+
+  // 模擬任務執行與虛實整合
+  const executeTask = async (steps) => {
+    setAgentStatus('執行中');
+    // 現在直接使用從 API 取得的步驟陣列
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i];
+      setTaskLog(prev => [...prev, { type: 'agent-executing', message: `步驟 ${i + 1}/${steps.length}：${step}` }]);
+      
+      // 模擬與物理世界的互動（例如：調整機器參數）
+      // 這裡可以加入實際的 API 呼叫來控制硬體
+      await new Promise(resolve => setTimeout(resolve, 2000)); // 模擬延遲
+    }
+
+    setAgentStatus('任務完成');
+    setTaskLog(prev => [...prev, { type: 'agent-done', message: '所有任務已完成！' }]);
+    setCommand('');
+  };
+
+  // 自定義模態框元件
+  const Modal = ({ title, message, isOpen, onClose }) => {
+    if (!isOpen) return null;
+
+    return createPortal(
+      <div className="fixed inset-0 bg-gray-600 bg-opacity-75 flex items-center justify-center p-4 z-50">
+        <div className="bg-white rounded-xl shadow-2xl w-full max-w-sm p-6 transform transition-all">
+          <div className="flex justify-between items-center mb-4 border-b pb-2">
+            <h3 className="text-xl font-bold text-gray-800">{title}</h3>
+            <button
+              onClick={onClose}
+              className="text-gray-400 hover:text-gray-600 transition-colors"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+          <p className="text-gray-700 mb-6">{message}</p>
+          <div className="flex justify-end">
+            <button
+              onClick={onClose}
+              className="bg-gray-500 hover:bg-gray-600 text-white font-semibold py-2 px-4 rounded-lg transition-colors"
+            >
+              關閉
+            </button>
+          </div>
+        </div>
+      </div>,
+      document.body
+    );
+  };
+
+  return (
+    <div className="font-sans antialiased text-gray-800 bg-gray-100 min-h-screen p-4 flex justify-center items-center">
+      <div className="w-full max-w-4xl bg-white rounded-2xl shadow-xl overflow-hidden md:flex">
+        {/* 左側：控制面板與資料顯示 */}
+        <div className="md:w-1/2 p-6 md:p-8 bg-white flex flex-col justify-between">
+          <div>
+            <h1 className="text-3xl font-bold mb-2 text-indigo-700">智慧製造 AI Agent</h1>
+            <p className="text-sm text-gray-500 mb-6">自主代理人優化生產流程系統</p>
+
+            {/* Agent 狀態顯示 */}
+            <div className="flex items-center mb-6">
+              <span className={`w-3 h-3 rounded-full mr-2 ${agentStatus === '閒置' ? 'bg-gray-400' : agentStatus === '思考中' ? 'bg-yellow-400 animate-pulse' : agentStatus === '執行中' ? 'bg-blue-500 animate-pulse' : 'bg-green-500'}`}></span>
+              <span className="font-semibold text-sm">狀態: {agentStatus}</span>
+            </div>
+
+            {/* 指令輸入區 */}
+            <form onSubmit={handleCommandSubmit} className="mb-6">
+              <label htmlFor="command-input" className="block text-sm font-medium text-gray-700 mb-2">
+                輸入指令:
+              </label>
+              <div className="flex rounded-lg shadow-sm">
+                <input
+                  id="command-input"
+                  type="text"
+                  value={command}
+                  onChange={(e) => setCommand(e.target.value)}
+                  placeholder="例如：優化第二條生產線的效率"
+                  className="flex-grow p-3 rounded-l-lg border border-gray-300 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                />
+                <button
+                  type="submit"
+                  className="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-3 px-6 rounded-r-lg transition-colors duration-300"
+                >
+                  發送
+                </button>
+              </div>
+            </form>
+
+            {/* 模擬資料串流 */}
+            <div className="bg-gray-50 rounded-lg p-4 shadow-inner">
+              <h2 className="text-lg font-bold text-gray-700 mb-3">多模態資料串流</h2>
+              <div className="grid grid-cols-2 gap-4 text-sm text-gray-600">
+                <div className="flex flex-col">
+                  <span className="font-medium text-gray-800">感測器資料:</span>
+                  <span>溫度: {sensorData.temperature} °C</span>
+                  <span>壓力: {sensorData.pressure} bar</span>
+                  <span>震動: {sensorData.vibration} g</span>
+                </div>
+                <div className="flex flex-col">
+                  <span className="font-medium text-gray-800">視覺輸入:</span>
+                  <div className="w-full h-24 bg-gray-200 rounded-lg flex items-center justify-center text-xs text-gray-500 overflow-hidden">
+                    <span role="img" aria-label="camera" className="text-4xl">📸</span>
+                  </div>
+                  <span>影像分析: 輕微品質波動</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        
+        {/* 右側：任務日誌與執行狀態 */}
+        <div className="md:w-1/2 p-6 md:p-8 bg-gray-50">
+          <h2 className="text-xl font-bold text-gray-700 mb-4">任務日誌</h2>
+          <div className="h-[400px] overflow-y-auto space-y-4 pr-2">
+            {taskLog.length === 0 && (
+              <div className="text-center text-gray-400 py-20">
+                <p>等待指令...</p>
+              </div>
+            )}
+            {taskLog.map((entry, index) => (
+              <div key={index} className={`rounded-lg p-3 shadow-md ${entry.type === 'user' ? 'bg-indigo-100 text-indigo-800' : entry.type.startsWith('agent') ? 'bg-white text-gray-800' : 'bg-red-100 text-red-800'}`}>
+                <p className="font-medium text-sm">
+                  {entry.type === 'user' && '使用者'}
+                  {entry.type === 'agent-plan' && '代理人 (規劃)'}
+                  {entry.type === 'agent-executing' && '代理人 (執行)'}
+                  {entry.type === 'agent-done' && '代理人 (完成)'}
+                  {entry.type === 'error' && '系統錯誤'}
+                </p>
+                <p className="text-xs">{entry.message}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+      <Modal
+        title={modalContent.title}
+        message={modalContent.message}
+        isOpen={isModalOpen}
+        onClose={() => setIsModalOpen(false)}
+      />
+    </div>
+  );
+};
+
+export default App;
